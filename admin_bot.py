@@ -6,10 +6,11 @@ import re
 import asyncio
 import signal
 import sys
+import glob
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     Application,
@@ -36,14 +37,13 @@ CHANNEL_ID = os.getenv('CHANNEL_ID', '')
 CHANNEL_LINK = os.getenv('CHANNEL_LINK', '')
 GROUP_ID = os.getenv('GROUP_ID', '')
 ADMIN_TAG = os.getenv('ADMIN_TAG', 'гарант')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # URL для вебхука
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
 WEBHOOK_PORT = int(os.getenv('WEBHOOK_PORT', '8443'))
 
 SUBSCRIPTION_CHECK_ENABLED = bool(CHANNEL_ID)
 WARNING_LIMIT = 2
 MUTE_DURATION = 4 * 3600
 
-# Константы для Telethon
 USERBOT_API_ID = 2040
 USERBOT_API_HASH = 'b18441a1ff607e10a989891a5462e627'
 USERBOT_SESSION = 'user_session'
@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 SCAMMERS_FILE = 'scammers.json'
 REPORTS_FILE = 'reports.json'
 STATS_FILE = 'stats.json'
+PERMANENT_STATS_FILE = 'permanent_stats.json'
 EVIDENCE_DIR = 'evidence'
 WARNED_USERS_FILE = 'warned_users.json'
 MUTED_USERS_FILE = 'muted_users.json'
@@ -81,41 +82,56 @@ def save_json(filename: str, data: Dict):
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+def cleanup_evidence():
+    try:
+        files = glob.glob(f"{EVIDENCE_DIR}/*.jpg")
+        for f in files:
+            try: os.remove(f)
+            except: pass
+        if files: logger.info(f"🧹 Очищено {len(files)} фото")
+    except: pass
+
+def cleanup_logs():
+    try:
+        for log_file in ['moderator_bot.log']:
+            if os.path.exists(log_file): open(log_file, 'w').close()
+        logger.info("🧹 Логи очищены")
+    except: pass
+
+def cleanup_reports():
+    try:
+        to_delete = [rid for rid, r in reports.items() if r.get('status') in ['approved', 'rejected'] and datetime.now() - datetime.fromisoformat(r.get('date', '2000-01-01T00:00:00')) > timedelta(days=1)]
+        for rid in to_delete: del reports[rid]
+        if to_delete: save_json(REPORTS_FILE, reports)
+    except: pass
+
+def cleanup_all():
+    cleanup_evidence()
+    cleanup_logs()
+    cleanup_reports()
+    logger.info("🧹 Полная очистка выполнена")
+
+permanent_stats = load_json(PERMANENT_STATS_FILE) or {'total_deals_completed': 0, 'total_deals_cancelled': 0}
 scammers = load_json(SCAMMERS_FILE)
 reports = load_json(REPORTS_FILE)
-stats = load_json(STATS_FILE)
+stats = load_json(STATS_FILE) or {'messages_deleted': 0, 'scammers_banned': 0, 'join_messages_deleted': 0, 'reports_processed': 0, 'reports_approved': 0, 'reports_rejected': 0, 'subscription_warnings': 0, 'users_muted': 0, 'deals_created': 0, 'deals_completed': 0, 'deals_cancelled': 0}
 warned_users = load_json(WARNED_USERS_FILE)
 muted_users = load_json(MUTED_USERS_FILE)
 deals = load_json(DEALS_FILE)
-deal_counter = load_json(DEAL_COUNTER_FILE)
-
-if not deal_counter:
-    deal_counter = {'counter': 0}
-
-if not stats:
-    stats = {
-        'messages_deleted': 0, 'scammers_banned': 0, 'join_messages_deleted': 0,
-        'reports_processed': 0, 'reports_approved': 0, 'reports_rejected': 0,
-        'subscription_warnings': 0, 'users_muted': 0,
-        'deals_created': 0, 'deals_completed': 0, 'deals_cancelled': 0
-    }
+deal_counter = load_json(DEAL_COUNTER_FILE) or {'counter': 0}
 
 pending_reports = {}
 pending_deals = {}
 admin_invites = {}
 report_assignments = {}
 app_job_queue = None
-bot_instance = None  # Глобальный экземпляр бота
+bot_instance = None
 
 resolved_owner_id = None
 resolved_admin_ids = []
 group_garant_ids = []
 
-# ============ SIGNAL HANDLER ============
-def signal_handler(sig, frame):
-    print("\n👋 Завершение работы бота...")
-    sys.exit(0)
-
+def signal_handler(sig, frame): print("\n👋 Завершение..."); sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
@@ -128,12 +144,9 @@ async def resolve_usernames(bot):
             username = OWNER_USERNAME.replace('@', '').strip()
             user = await bot.get_chat(f'@{username}')
             resolved_owner_id = user.id
-            logger.info(f"👑 Владелец: @{username} = {user.id}")
-        except Exception as e:
-            logger.error(f"Не удалось найти владельца: {e}")
+        except: pass
     
-    if OWNER_ID and not resolved_owner_id:
-        resolved_owner_id = OWNER_ID
+    if OWNER_ID and not resolved_owner_id: resolved_owner_id = OWNER_ID
     
     ADMIN_IDS_RAW = os.getenv('ADMIN_IDS', '')
     ADMIN_USERNAMES = os.getenv('ADMIN_USERNAMES', '')
@@ -146,874 +159,625 @@ async def resolve_usernames(bot):
             if username:
                 try:
                     user = await bot.get_chat(f'@{username}')
-                    if user.id not in resolved_admin_ids:
-                        resolved_admin_ids.append(user.id)
-                except:
-                    pass
-    
-    logger.info(f"👑 Владелец: {resolved_owner_id}, 👮 Из .env: {len(resolved_admin_ids)}")
+                    if user.id not in resolved_admin_ids: resolved_admin_ids.append(user.id)
+                except: pass
 
 async def load_garants_from_group(bot):
     global group_garant_ids
-    if not GROUP_ID:
-        return
+    if not GROUP_ID: return
     try:
         group_garant_ids = []
         admins = await bot.get_chat_administrators(chat_id=GROUP_ID)
         for admin in admins:
             title = getattr(admin, 'custom_title', '') or ''
-            if ADMIN_TAG.lower() in title.lower():
-                group_garant_ids.append(admin.user.id)
-                logger.info(f"🏷 Гарант: {admin.user.first_name} (ID: {admin.user.id})")
-        logger.info(f"🏷 Гарантов: {len(group_garant_ids)}")
-    except Exception as e:
-        logger.error(f"Ошибка загрузки гарантов: {e}")
+            if ADMIN_TAG.lower() in title.lower(): group_garant_ids.append(admin.user.id)
+    except: pass
 
 async def admin_status_changed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_member_update = update.chat_member
-    if not chat_member_update:
-        return
-    group_id_str = str(GROUP_ID).replace('-100', '').replace('-', '')
-    chat_id_str = str(chat_member_update.chat.id).replace('-100', '').replace('-', '')
-    if group_id_str != chat_id_str:
-        return
+    if not update.chat_member: return
     await load_garants_from_group(context.bot)
 
-# ============ УДАЛЕНИЕ СООБЩЕНИЙ С ЗАДЕРЖКОЙ ============
+# ============ УДАЛЕНИЕ СООБЩЕНИЙ ============
 async def delete_message_later(chat_id: int, message_id: int, delay: int = 10):
-    """Удаление сообщения через указанное время"""
     await asyncio.sleep(delay)
     try:
-        if bot_instance:
-            await bot_instance.delete_message(chat_id=chat_id, message_id=message_id)
-            logger.info(f"🗑 Сообщение {message_id} удалено через {delay}с")
-    except Exception as e:
-        logger.error(f"Ошибка удаления сообщения {message_id}: {e}")
+        if bot_instance: await bot_instance.delete_message(chat_id=chat_id, message_id=message_id)
+    except: pass
 
 # ============ ПРОВЕРКА ПОДПИСКИ И МУТ ============
 async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not SUBSCRIPTION_CHECK_ENABLED or not CHANNEL_ID:
-        return True
+    if not SUBSCRIPTION_CHECK_ENABLED or not CHANNEL_ID: return True
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        is_subscribed = member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]
-        return is_subscribed
-    except Exception as e:
-        logger.warning(f"Ошибка проверки подписки (пропускаем): {e}")
-        return True
+        return member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]
+    except: return True
 
-async def mute_user_via_userbot(user_id: int, chat_id: str, duration_seconds: int) -> bool:
+async def mute_user(user_id: int, chat_id: str, duration: int, context) -> bool:
     client = TelegramClient(USERBOT_SESSION, USERBOT_API_ID, USERBOT_API_HASH)
     try:
         await client.connect()
-        if not await client.is_user_authorized():
+        if await client.is_user_authorized():
+            g = await client.get_entity(int(chat_id))
+            until = datetime.now() + timedelta(seconds=duration)
+            rights = ChatBannedRights(
+                until_date=until, view_messages=False,
+                send_messages=True, send_media=True, send_stickers=True,
+                send_gifs=True, send_games=True, send_inline=True,
+                embed_links=True, send_polls=True,
+                change_info=False, invite_users=False, pin_messages=False
+            )
+            await client(EditBannedRequest(channel=g, participant=user_id, banned_rights=rights))
             await client.disconnect()
-            return False
-        
-        group = await client.get_entity(int(chat_id))
-        until_date = datetime.now() + timedelta(seconds=duration_seconds)
-        
-        muted_rights = ChatBannedRights(
-            until_date=until_date,
-            view_messages=False, send_messages=True, send_media=True,
-            send_stickers=True, send_gifs=True, send_games=True,
-            send_inline=True, embed_links=True, send_polls=True,
-            change_info=False, invite_users=False, pin_messages=False
-        )
-        
-        await client(EditBannedRequest(channel=group, participant=user_id, banned_rights=muted_rights))
-        await client.disconnect()
-        logger.info(f"✅ Пользователь {user_id} замучен на {duration_seconds}с через userbot")
-        return True
-    except Exception as e:
-        await client.disconnect()
-        logger.error(f"Ошибка мута через userbot: {e}")
-        return False
-
-async def mute_user_via_bot(user_id: int, chat_id: str, duration_seconds: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+            return True
+    except: pass
+    finally:
+        try: await client.disconnect()
+        except: pass
     try:
-        until_date = datetime.now() + timedelta(seconds=duration_seconds)
+        until = datetime.now() + timedelta(seconds=duration)
         await context.bot.restrict_chat_member(
             chat_id=chat_id, user_id=user_id,
-            permissions={
-                'can_send_messages': False, 'can_send_media': False,
-                'can_send_other_messages': False, 'can_add_web_page_previews': False
-            },
-            until_date=until_date
+            permissions={'can_send_messages': False, 'can_send_media': False, 'can_send_other_messages': False, 'can_add_web_page_previews': False},
+            until_date=until
         )
-        logger.info(f"✅ Пользователь {user_id} замучен через бота на {duration_seconds}с")
         return True
-    except Exception as e:
-        logger.error(f"Ошибка мута через бота: {e}")
-        return False
+    except: return False
 
 async def handle_unsubscribed_user(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Обработка неподписанного пользователя"""
-    
-    # Удаляем сообщение пользователя
-    try:
-        await update.message.delete()
-    except:
-        pass
+    try: await update.message.delete()
+    except: pass
     stats['messages_deleted'] = stats.get('messages_deleted', 0) + 1
-    
     user_key = str(user_id)
     now = datetime.now()
-    
-    channel_link = CHANNEL_LINK or f"https://t.me/{CHANNEL_ID.replace('@', '')}"
+    link = CHANNEL_LINK or f"https://t.me/{CHANNEL_ID.replace('@', '')}"
     user = await context.bot.get_chat(user_id)
-    user_name = user.first_name or 'Пользователь'
+    name = user.first_name or 'Пользователь'
     
     if user_key not in warned_users:
-        warned_users[user_key] = {'count': 1, 'first_warning': now.isoformat(), 'last_warning': now.isoformat()}
+        warned_users[user_key] = {'count': 1}
         save_json(WARNED_USERS_FILE, warned_users)
-        
-        warn_msg = await update.message.chat.send_message(
-            f"⚠️ {user_name}, подпишитесь на канал чтобы писать!\n{channel_link}\n\n"
-            f"Предупреждение 1/{WARNING_LIMIT}\n"
-            f"После {WARNING_LIMIT} предупреждений - мут на 4 часа.\n\n"
-            f"Сообщение исчезнет через 10 секунд",
-            disable_web_page_preview=True
-        )
-        asyncio.create_task(delete_message_later(warn_msg.chat_id, warn_msg.message_id, 10))
-        
+        msg = await update.message.chat.send_message(f"⚠️ {name}, подпишитесь: {link}\n\nПредупреждение 1/{WARNING_LIMIT}\nПосле {WARNING_LIMIT} - мут 4ч\n\nИсчезнет через 10с", disable_web_page_preview=True)
+        asyncio.create_task(delete_message_later(msg.chat_id, msg.message_id, 10))
         stats['subscription_warnings'] = stats.get('subscription_warnings', 0) + 1
-        save_json(STATS_FILE, stats)
     else:
         warned_users[user_key]['count'] += 1
-        warned_users[user_key]['last_warning'] = now.isoformat()
-        warning_count = warned_users[user_key]['count']
+        cnt = warned_users[user_key]['count']
         save_json(WARNED_USERS_FILE, warned_users)
-        
-        if warning_count >= WARNING_LIMIT:
-            logger.info(f"🔇 Мутим {user_id} на 4 часа")
-            
-            muted = await mute_user_via_userbot(user_id, GROUP_ID or str(update.message.chat_id), MUTE_DURATION)
-            if not muted:
-                muted = await mute_user_via_bot(user_id, GROUP_ID or str(update.message.chat_id), MUTE_DURATION, context)
-            
-            if muted:
+        if cnt >= WARNING_LIMIT:
+            if await mute_user(user_id, GROUP_ID or str(update.message.chat_id), MUTE_DURATION, context):
                 stats['users_muted'] = stats.get('users_muted', 0) + 1
-                save_json(STATS_FILE, stats)
-                
-                muted_users[user_key] = {
-                    'muted_at': now.isoformat(),
-                    'muted_until': (now + timedelta(seconds=MUTE_DURATION)).isoformat(),
-                    'reason': f'Не подписался на канал после {WARNING_LIMIT} предупреждений'
-                }
+                muted_users[user_key] = {'at': now.isoformat(), 'until': (now + timedelta(seconds=MUTE_DURATION)).isoformat()}
                 save_json(MUTED_USERS_FILE, muted_users)
-                
-                mute_msg = await update.message.chat.send_message(
-                    f"🔇 {user_name} замучен на 4 часа!\nПричина: не подписался на канал {channel_link}\n\nСообщение исчезнет через 10 секунд"
-                )
-                asyncio.create_task(delete_message_later(mute_msg.chat_id, mute_msg.message_id, 10))
-                
+                msg = await update.message.chat.send_message(f"🔇 {name} замучен на 4ч\nИсчезнет через 10с")
+                asyncio.create_task(delete_message_later(msg.chat_id, msg.message_id, 10))
                 warned_users[user_key]['count'] = 0
                 save_json(WARNED_USERS_FILE, warned_users)
-            else:
-                warn_msg = await update.message.chat.send_message(
-                    f"⚠️ {user_name}, подпишитесь на канал!\n{channel_link}\n\n"
-                    f"Предупреждение {warning_count}/{WARNING_LIMIT}\nСообщение исчезнет через 10 секунд"
-                )
-                asyncio.create_task(delete_message_later(warn_msg.chat_id, warn_msg.message_id, 10))
         else:
-            warn_msg = await update.message.chat.send_message(
-                f"⚠️ {user_name}, подпишитесь на канал чтобы писать!\n{channel_link}\n\n"
-                f"Предупреждение {warning_count}/{WARNING_LIMIT}\n"
-                f"После {WARNING_LIMIT} предупреждений - мут на 4 часа.\n\n"
-                f"Сообщение исчезнет через 10 секунд",
-                disable_web_page_preview=True
-            )
-            asyncio.create_task(delete_message_later(warn_msg.chat_id, warn_msg.message_id, 10))
-            
+            msg = await update.message.chat.send_message(f"⚠️ {name}, подпишитесь: {link}\n\nПредупреждение {cnt}/{WARNING_LIMIT}\nИсчезнет через 10с", disable_web_page_preview=True)
+            asyncio.create_task(delete_message_later(msg.chat_id, msg.message_id, 10))
             stats['subscription_warnings'] = stats.get('subscription_warnings', 0) + 1
-            save_json(STATS_FILE, stats)
+    save_json(STATS_FILE, stats)
 
-# ============ БАН ЧЕРЕЗ USERBOT ============
-async def ban_user_via_userbot(user_id, username: str = "", group_id: str = None) -> bool:
-    if not group_id:
-        group_id = GROUP_ID
-    if not group_id:
-        return False
-    
+# ============ БАН ============
+async def ban_user(user_id, username: str = "", group_id: str = None) -> bool:
+    if not group_id: group_id = GROUP_ID
+    if not group_id: return False
     client = TelegramClient(USERBOT_SESSION, USERBOT_API_ID, USERBOT_API_HASH)
     try:
         await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return False
-        
-        resolved_id = user_id
-        clean_username = username.replace('@', '').strip() if username else ""
-        
-        if (not resolved_id or resolved_id == 0) and clean_username:
-            try:
-                entity = await client.get_entity(f'@{clean_username}')
-                resolved_id = entity.id
-            except:
-                pass
-        
-        if not resolved_id:
-            await client.disconnect()
-            return False
-        
-        group = await client.get_entity(int(group_id))
-        
-        banned_rights = ChatBannedRights(
-            until_date=None,
-            view_messages=True, send_messages=True, send_media=True,
-            send_stickers=True, send_gifs=True, send_games=True,
-            send_inline=True, embed_links=True, send_polls=True,
-            change_info=True, invite_users=True, pin_messages=True
-        )
-        
-        await client(EditBannedRequest(channel=group, participant=resolved_id, banned_rights=banned_rights))
+        if not await client.is_user_authorized(): await client.disconnect(); return False
+        resolved = user_id
+        clean = username.replace('@', '').strip() if username else ""
+        if (not resolved or resolved == 0) and clean:
+            try: resolved = (await client.get_entity(f'@{clean}')).id
+            except: pass
+        if not resolved: await client.disconnect(); return False
+        g = await client.get_entity(int(group_id))
+        rights = ChatBannedRights(until_date=None, view_messages=True, send_messages=True, send_media=True, send_stickers=True, send_gifs=True, send_games=True, send_inline=True, embed_links=True, send_polls=True, change_info=True, invite_users=True, pin_messages=True)
+        await client(EditBannedRequest(channel=g, participant=resolved, banned_rights=rights))
         await client.disconnect()
         return True
     except:
-        await client.disconnect()
+        try: await client.disconnect()
+        except: pass
         return False
 
 # ============ ПРОВЕРКА ДОСТУПА ============
-def is_owner(user_id: int) -> bool:
-    return resolved_owner_id is not None and user_id == resolved_owner_id
-
-def is_admin(user_id: int) -> bool:
-    return user_id in resolved_admin_ids or user_id in group_garant_ids
-
-def is_staff(user_id: int) -> bool:
-    return is_owner(user_id) or is_admin(user_id)
+def is_owner(uid: int) -> bool: return resolved_owner_id is not None and uid == resolved_owner_id
+def is_admin(uid: int) -> bool: return uid in resolved_admin_ids or uid in group_garant_ids
+def is_staff(uid: int) -> bool: return is_owner(uid) or is_admin(uid)
 
 def get_random_admin(exclude: List[int] = None) -> Optional[int]:
-    all_admins = list(set(resolved_admin_ids + group_garant_ids))
-    if not all_admins:
-        return None
-    available = [a for a in all_admins if a not in (exclude or [])]
-    if not available:
-        return None
-    return random.choice(available)
+    all_a = list(set(resolved_admin_ids + group_garant_ids))
+    if not all_a: return None
+    avail = [a for a in all_a if a not in (exclude or [])]
+    return random.choice(avail) if avail else None
 
 def get_next_deal_number() -> int:
     deal_counter['counter'] += 1
     save_json(DEAL_COUNTER_FILE, deal_counter)
     return deal_counter['counter']
 
-# ============ ПАРСИНГ /deal ============
-def parse_deal_command(text: str) -> Optional[Dict]:
+def parse_deal(text: str) -> Optional[Dict]:
     parts = text.strip().split()
-    if len(parts) < 3:
-        return None
-    if not parts[1].startswith('@'):
-        return None
-    return {
-        'partner_username': parts[1].replace('@', ''),
-        'price': parts[2],
-        'description': ' '.join(parts[3:]) if len(parts) > 3 else ''
-    }
+    if len(parts) < 3 or not parts[1].startswith('@'): return None
+    return {'partner': parts[1][1:], 'price': parts[2], 'desc': ' '.join(parts[3:]) if len(parts) > 3 else ''}
 
 # ============ СДЕЛКИ ============
 async def deal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("⚠️ Сделки создаются в личных сообщениях с ботом!")
-        return
-    
+    if update.message.chat.type != 'private': await update.message.reply_text("⚠️ Сделки в ЛС!"); return
     user = update.effective_user
-    text = update.message.text or ""
+    p = parse_deal(update.message.text or "")
+    if not p: await update.message.reply_text("❌ /deal @user цена [описание]"); return
+    if not list(set(resolved_admin_ids + group_garant_ids)): await update.message.reply_text("❌ Нет гарантов"); return
     
-    parsed = parse_deal_command(text)
-    
-    if not parsed:
-        await update.message.reply_text(
-            "❌ Неверный формат!\n\n"
-            "/deal @username цена описание\n\n"
-            "Примеры:\n"
-            "/deal @seller 500$ Продажа канала\n"
-            "/deal @buyer 0.5 BTC Обмен"
-        )
-        return
-    
-    all_admins = list(set(resolved_admin_ids + group_garant_ids))
-    if not all_admins:
-        await update.message.reply_text("❌ Нет доступных гарантов.")
-        return
-    
-    deal_number = get_next_deal_number()
-    deal_id = str(datetime.now().timestamp())
-    
-    pending_deals[user.id] = {
-        'deal_id': deal_id, 'deal_number': deal_number,
-        'creator_id': str(user.id), 'creator_username': user.username or str(user.id),
-        'partner_username': parsed['partner_username'],
-        'price': parsed['price'], 'description': parsed['description'],
-        'status': 'waiting_for_group', 'created_date': datetime.now().isoformat(),
-        'excluded_admins': []
-    }
-    
-    desc = f"\n📝 {parsed['description']}" if parsed['description'] else ""
-    
-    await update.message.reply_text(
-        f"📋 Сделка #{deal_number} создана!\n\n"
-        f"👤 Вторая сторона: @{parsed['partner_username']}\n"
-        f"💰 Цена: {parsed['price']}{desc}\n\n"
-        f"Дальнейшие шаги:\n"
-        f"1. Создайте группу для сделки\n"
-        f"2. Добавьте бота в группу\n"
-        f"3. Сделайте бота администратором\n"
-        f"4. Добавьте второго участника @{parsed['partner_username']}\n"
-        f"5. Отправьте команду /ready в группе\n\n"
-        f"После этого бот пригласит гаранта."
-    )
+    dn = get_next_deal_number()
+    did = str(datetime.now().timestamp())
+    pending_deals[user.id] = {'did': did, 'dn': dn, 'creator': str(user.id), 'cname': user.username or str(user.id), 'partner': p['partner'], 'price': p['price'], 'desc': p['desc'], 'status': 'waiting', 'excluded': []}
+    d = f"\n📝 {p['desc']}" if p['desc'] else ""
+    await update.message.reply_text(f"📋 Сделка #{dn}\n👤 @{p['partner']}\n💰 {p['price']}{d}\n\n1. Создайте группу\n2. Добавьте бота админом\n3. Добавьте @{p['partner']}\n4. /ready в группе\n\n⚠️ Настоящий гарант подтверждается ботом в чате!")
 
 async def ready_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("⚠️ Эта команда работает только в группе сделки!")
-        return
-    
+    if update.message.chat.type not in ['group', 'supergroup']: return
     user = update.effective_user
-    chat_id = update.message.chat_id
-    
-    deal_data = pending_deals.get(user.id)
-    
-    if not deal_data:
-        await update.message.reply_text("❌ У вас нет активной сделки. Создайте в ЛС: /deal @username цена")
-        return
-    
+    dd = pending_deals.get(user.id)
+    if not dd: await update.message.reply_text("❌ Нет сделки. /deal в ЛС"); return
     try:
-        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
-            await update.message.reply_text("❌ Бот не администратор! Сделайте бота админом и повторите /ready")
-            return
-    except:
-        await update.message.reply_text("❌ Бот не в группе! Добавьте бота и сделайте админом.")
-        return
+        if (await context.bot.get_chat_member(update.message.chat_id, context.bot.id)).status != ChatMemberStatus.ADMINISTRATOR:
+            await update.message.reply_text("❌ Бот не админ!"); return
+    except: await update.message.reply_text("❌ Бот не в группе!"); return
     
-    deal_number = deal_data['deal_number']
-    deal_id = deal_data['deal_id']
+    try: link = (await context.bot.create_chat_invite_link(update.message.chat_id)).invite_link
+    except: link = f"https://t.me/c/{str(update.message.chat_id).replace('-100', '')}"
     
-    try:
-        invite = await context.bot.create_chat_invite_link(chat_id)
-        invite_url = invite.invite_link
-    except:
-        invite_url = f"https://t.me/c/{str(chat_id).replace('-100', '')}"
-    
-    deals[deal_id] = {
-        'deal_id': deal_id, 'deal_number': deal_number,
-        'chat_id': str(chat_id), 'invite_link': invite_url,
-        'creator_id': deal_data['creator_id'], 'creator_username': deal_data['creator_username'],
-        'partner_username': deal_data['partner_username'],
-        'price': deal_data['price'], 'description': deal_data['description'],
-        'status': 'active', 'admin_accepted': False,
-        'excluded_admins': deal_data.get('excluded_admins', []),
-        'created_date': datetime.now().isoformat()
-    }
-    
+    deals[dd['did']] = {'did': dd['did'], 'dn': dd['dn'], 'cid': str(update.message.chat_id), 'link': link, 'creator': dd['creator'], 'cname': dd['cname'], 'partner': dd['partner'], 'price': dd['price'], 'desc': dd['desc'], 'status': 'active', 'accepted': False, 'excluded': dd.get('excluded', [])}
     save_json(DEALS_FILE, deals)
     stats['deals_created'] = stats.get('deals_created', 0) + 1
     save_json(STATS_FILE, stats)
-    
     del pending_deals[user.id]
-    
-    desc = f"\n📝 {deal_data['description']}" if deal_data.get('description') else ""
-    
-    await update.message.reply_text(
-        f"📢 ОБЪЯВЛЕНИЕ О СДЕЛКЕ #{deal_number}\n\n"
-        f"👤 @{deal_data['creator_username']} ↔ @{deal_data['partner_username']}\n"
-        f"💰 {deal_data['price']}{desc}\n\n⏳ Ожидается гарант..."
-    )
-    
-    await invite_admin_to_deal(context, deal_id)
+    d = f"\n📝 {dd['desc']}" if dd.get('desc') else ""
+    await update.message.reply_text(f"📢 СДЕЛКА #{dd['dn']}\n👤 @{dd['cname']} ↔ @{dd['partner']}\n💰 {dd['price']}{d}\n🆔 `{dd['did'][:10]}`\n⏳ Гарант...")
+    await invite_admin(context, dd['did'])
 
-async def invite_admin_to_deal(context: ContextTypes.DEFAULT_TYPE, deal_id: str):
-    if deal_id not in deals: return
-    deal = deals[deal_id]
-    excluded = deal.get('excluded_admins', [])
-    admin_id = get_random_admin(exclude=excluded)
+async def invite_admin(context, did: str):
+    if did not in deals: return
+    d = deals[did]
+    aid = get_random_admin(exclude=d.get('excluded', []))
+    if not aid: await cancel_deal(context, did, "Нет гарантов"); return
     
-    if admin_id is None:
-        await cancel_deal(context, deal_id, "Все гаранты отказались или не ответили.")
-        return
-    
-    admin_invites[deal_id] = {
-        'admin_id': admin_id, 'expires': datetime.now() + timedelta(minutes=5),
-        'excluded_admins': excluded + [admin_id]
+    # Сохраняем context для таймаута
+    admin_invites[did] = {
+        'aid': aid,
+        'exp': datetime.now() + timedelta(minutes=5),
+        'excluded': d.get('excluded', []) + [aid],
+        'message_id': None,
+        'chat_id': aid,
+        'context': context,  # СОХРАНЯЕМ CONTEXT
+        'deal_id': did
     }
-    deal['excluded_admins'] = excluded + [admin_id]
+    d['excluded'] = d.get('excluded', []) + [aid]
     save_json(DEALS_FILE, deals)
     
-    keyboard = [[
-        InlineKeyboardButton("✅ Принять сделку", callback_data=f"admin_accept_deal_{deal_id}"),
-        InlineKeyboardButton("❌ Отказаться", callback_data=f"admin_decline_deal_{deal_id}")
+    kb = [[
+        InlineKeyboardButton("✅ Принять", callback_data=f"ad_{did}"),
+        InlineKeyboardButton("❌ Отказ", callback_data=f"adc_{did}")
     ]]
     
     try:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=f"🔒 НОВАЯ СДЕЛКА #{deal.get('deal_number', '?')}\n\n"
-                 f"👤 @{deal['creator_username']} ↔ @{deal['partner_username']}\n"
-                 f"💰 {deal['price']}\n🔗 {deal['invite_link']}\n\n⏳ 5 минут на ответ!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        msg = await context.bot.send_message(
+            aid,
+            f"🔒 СДЕЛКА #{d.get('dn','?')}\n\n"
+            f"👤 @{d['cname']} ↔ @{d['partner']}\n"
+            f"💰 {d['price']}\n"
+            f"🔗 {d['link']}\n"
+            f"🆔 `{did[:10]}`\n\n"
+            f"⏳ 5 минут!\n"
+            f"При входе в группу бот подтвердит вас.",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
-        asyncio.create_task(check_deal_timeout(context, deal_id, 300))
-    except:
-        await invite_admin_to_deal(context, deal_id)
+        admin_invites[did]['message_id'] = msg.message_id
+        logger.info(f"✅ Приглашение отправлено гаранту {aid} для сделки {did[:10]}")
+        
+        # Запускаем таймер
+        asyncio.create_task(check_deal_timeout(did, 300))
+    except Exception as e:
+        logger.error(f"Ошибка отправки гаранту {aid}: {e}")
+        # Пробуем следующего
+        await invite_admin(context, did)
 
-async def check_deal_timeout(context, deal_id: str, delay: int = 300):
+async def check_deal_timeout(did: str, delay: int = 300):
+    """Таймаут ответа гаранта с удалением сообщения"""
     await asyncio.sleep(delay)
-    if deal_id not in deals or deals[deal_id].get('admin_accepted'): return
-    invite = admin_invites.get(deal_id)
-    if not invite: return
-    try: await context.bot.send_message(chat_id=invite['admin_id'], text=f"⏰ Время истекло. Сделка передана.")
-    except: pass
-    await invite_admin_to_deal(context, deal_id)
+    
+    if did not in deals:
+        logger.info(f"Сделка {did[:10]} уже не существует")
+        return
+    
+    if deals[did].get('accepted'):
+        logger.info(f"Сделка {did[:10]} уже принята")
+        return
+    
+    invite = admin_invites.get(did)
+    if not invite:
+        logger.info(f"Приглашение для {did[:10]} не найдено")
+        return
+    
+    logger.info(f"⏰ Таймаут сделки {did[:10]}, удаляю сообщение у {invite['aid']}")
+    
+    # Удаляем сообщение с кнопками у старого гаранта
+    try:
+        if invite.get('message_id') and invite.get('chat_id'):
+            context = invite.get('context')
+            if context:
+                await context.bot.delete_message(
+                    chat_id=invite['chat_id'],
+                    message_id=invite['message_id']
+                )
+                logger.info(f"🗑 Сообщение у гаранта {invite['aid']} удалено")
+    except Exception as e:
+        logger.error(f"Ошибка удаления: {e}")
+    
+    # Временное уведомление
+    try:
+        context = invite.get('context')
+        if context:
+            notify = await context.bot.send_message(
+                invite['aid'],
+                "⏰ Время на сделку истекло. Сделка передана другому гаранту."
+            )
+            asyncio.create_task(delete_message_later(invite['aid'], notify.message_id, 30))
+    except Exception as e:
+        logger.error(f"Ошибка уведомления: {e}")
+    
+    # Приглашаем следующего гаранта
+    context = invite.get('context')
+    if context:
+        logger.info(f"📤 Отправляю приглашение следующему гаранту для {did[:10]}")
+        await invite_admin(context, did)
+    else:
+        logger.error(f"❌ Нет context для приглашения следующего гаранта!")
 
-async def cancel_deal(context: ContextTypes.DEFAULT_TYPE, deal_id: str, reason: str = ""):
-    if deal_id not in deals: return
-    deal = deals[deal_id]
-    try: await context.bot.send_message(chat_id=int(deal['chat_id']), text=f"❌ Сделка отменена\n\n{reason}\n\nБот покидает группу.")
+async def cancel_deal(context, did: str, reason: str = ""):
+    if did not in deals: return
+    d = deals[did]
+    try: await context.bot.send_message(int(d['cid']), f"❌ Отменена\n{reason}")
     except: pass
-    try: await context.bot.leave_chat(chat_id=int(deal['chat_id']))
+    try: await context.bot.leave_chat(int(d['cid']))
     except: pass
-    deal['status'] = 'cancelled'
+    d['status'] = 'cancelled'
     save_json(DEALS_FILE, deals)
     stats['deals_cancelled'] = stats.get('deals_cancelled', 0) + 1
+    permanent_stats['total_deals_cancelled'] += 1
     save_json(STATS_FILE, stats)
+    save_json(PERMANENT_STATS_FILE, permanent_stats)
 
 async def admin_deal_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    admin = query.from_user
-    if not is_staff(admin.id): await query.answer("❌ Нет прав!", show_alert=True); return
+    q = update.callback_query; await q.answer()
+    if not is_staff(q.from_user.id): await q.answer("❌ Нет прав!", show_alert=True); return
+    data = q.data
     
-    data = query.data
-    if 'admin_accept_deal_' in data:
-        deal_id = data.replace('admin_accept_deal_', '')
-        if deal_id not in deals: await query.edit_message_text("❌ Не найдена."); return
-        deal = deals[deal_id]
-        deal['admin_accepted'] = True
-        deal['assigned_admin'] = str(admin.id)
+    if data.startswith('ad_'):
+        did = data[3:]
+        if did not in deals: await q.edit_message_text("❌"); return
+        
+        d = deals[did]
+        d['accepted'] = True
+        d['admin_id'] = str(q.from_user.id)
+        d['admin_name'] = q.from_user.username or str(q.from_user.id)
         save_json(DEALS_FILE, deals)
-        try: await context.bot.add_chat_member(chat_id=int(deal['chat_id']), user_id=admin.id)
+        
+        try: await context.bot.add_chat_member(int(d['cid']), q.from_user.id)
         except: pass
-        await query.edit_message_text(f"✅ Принято!\n🔗 {deal['invite_link']}")
-    elif 'admin_decline_deal_' in data:
-        deal_id = data.replace('admin_decline_deal_', '')
-        if deal_id not in deals: await query.edit_message_text("❌ Не найдена."); return
-        await query.edit_message_text("❌ Отказано. Ищем другого...")
-        await invite_admin_to_deal(context, deal_id)
+        
+        # Подтверждение в группе
+        try:
+            await context.bot.send_message(int(d['cid']), f"👮 *Гарант подтвержден!*\n\nГарант @{d['admin_name']} присоединился к сделке #{d.get('dn','?')}\n🆔 `{did[:10]}`\n\n✅ Это НАСТОЯЩИЙ гарант.\n⚠️ Сохраняйте скриншоты! \n если гарант не присоеденился, хотя подтверждение было. Владелец должен добавить гаранта вручную по нужному @username.", parse_mode=ParseMode.MARKDOWN)
+        except: pass
+        
+        await q.edit_message_text(f"✅ Вы приняли сделку #{d.get('dn','?')}\n🆔 `{did[:10]}`\n🔗 {d['link']}", parse_mode=ParseMode.MARKDOWN)
+        
+        try: await context.bot.send_message(int(d['creator']), f"✅ Гарант @{d['admin_name']} назначен на сделку #{d.get('dn','?')}\n🆔 `{did[:10]}`")
+        except: pass
+    
+    elif data.startswith('adc_'):
+        did = data[4:]
+        if did not in deals: await q.edit_message_text("❌"); return
+        await q.edit_message_text("❌ Вы отказались. Ищем другого...")
+        await invite_admin(context, did)
 
 async def close_deal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_staff(update.effective_user.id): await update.message.reply_text("❌ Нет прав!"); return
-    if update.message.chat.type != 'private': await update.message.reply_text("⚠️ Только в ЛС!"); return
+    if not is_staff(update.effective_user.id): await update.message.reply_text("❌"); return
     if not context.args: await update.message.reply_text("❌ /close_deal [id]"); return
-    deal_id = context.args[0]
-    found = next((k for k in deals if k.startswith(deal_id)), None)
-    if not found: await update.message.reply_text("❌ Не найдена!"); return
-    deal = deals[found]
-    deal['status'] = 'completed'
+    found = next((k for k in deals if k.startswith(context.args[0])), None)
+    if not found: await update.message.reply_text("❌"); return
+    deals[found]['status'] = 'completed'
     save_json(DEALS_FILE, deals)
     stats['deals_completed'] = stats.get('deals_completed', 0) + 1
+    permanent_stats['total_deals_completed'] += 1
     save_json(STATS_FILE, stats)
-    try: await context.bot.send_message(chat_id=int(deal['chat_id']), text="✅ Сделка завершена! Бот покидает группу.")
+    save_json(PERMANENT_STATS_FILE, permanent_stats)
+    try: await context.bot.send_message(int(deals[found]['cid']), "✅ Завершена!")
     except: pass
-    try: await context.bot.leave_chat(chat_id=int(deal['chat_id']))
+    try: await context.bot.leave_chat(int(deals[found]['cid']))
     except: pass
-    await update.message.reply_text("✅ Закрыта!")
+    await update.message.reply_text("✅")
 
 # ============ ЖАЛОБЫ ============
-async def scam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("⚠️ Пишите боту в ЛС!"); return
-    args = context.args
+    if update.message.chat.type != 'private': await update.message.reply_text("⚠️ ЛС!"); return
+    cap = update.message.caption or update.message.text or ""
+    args_text = cap.replace('/report', '', 1).strip() if cap.startswith('/report') else cap
+    args = args_text.split() if args_text else []
+    sid, suname, reason, photos = "", "", "", []
     if update.message.reply_to_message:
-        replied = update.message.reply_to_message
-        if replied.forward_from:
-            scammer_id = replied.forward_from.id
-            scammer_username = replied.forward_from.username or f'id{scammer_id}'
-        elif replied.from_user and replied.from_user.id != user.id:
-            scammer_id = replied.from_user.id
-            scammer_username = replied.from_user.username or f'id{scammer_id}'
-        else:
-            await update.message.reply_text("❌ Ответьте на сообщение скамера!"); return
-        pending_reports[user.id] = {
-            'state': 'waiting_evidence', 'scammer_username': scammer_username,
-            'scammer_id': str(scammer_id), 'reason': ' '.join(args) if args else ''
-        }
-        await update.message.reply_text(f"📝 Жалоба на @{scammer_username}\n📎 Прикрепите фото или /done")
-        return
-    if args and args[0].startswith('@'):
-        pending_reports[user.id] = {
-            'state': 'waiting_evidence', 'scammer_username': args[0][1:],
-            'scammer_id': '', 'reason': ' '.join(args[1:]) if len(args) > 1 else ''
-        }
-        await update.message.reply_text(f"📝 Жалоба на {args[0]}\n📎 Прикрепите фото или /done")
-        return
-    await update.message.reply_text("📝 /scam @username Причина")
-
-async def handle_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in pending_reports: return
-    report = pending_reports[user.id]
-    if report['state'] != 'waiting_evidence': return
-    report.setdefault('photos', [])
-    if len(report['photos']) >= 5: await update.message.reply_text("⚠️ Макс 5! /done"); return
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    filename = f"{EVIDENCE_DIR}/{user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(report['photos'])}.jpg"
-    await file.download_to_drive(filename)
-    report['photos'].append(filename)
-    await update.message.reply_text(f"📸 {len(report['photos'])}/5\n/done")
-
-async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in pending_reports: await update.message.reply_text("❌ Нет жалобы."); return
-    report_data = pending_reports[user.id]
-    if not report_data.get('reason'): report_data['state'] = 'waiting_reason'; await update.message.reply_text("📝 Укажите причину:"); return
-    await submit_report(update, context, user, report_data)
-
-async def handle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in pending_reports: return
-    report = pending_reports[user.id]
-    if report['state'] != 'waiting_reason': return
-    if update.message.text.startswith('/'): return
-    report['reason'] = update.message.text
-    await submit_report(update, context, user, report)
-
-async def submit_report(update: Update, context: ContextTypes.DEFAULT_TYPE, user, report_data: Dict):
-    report_id = str(datetime.now().timestamp())
-    reports[report_id] = {
-        'report_id': report_id,
-        'scammer_username': report_data.get('scammer_username', ''),
-        'scammer_id': report_data.get('scammer_id', ''),
-        'reason': report_data.get('reason', ''),
-        'photos': report_data.get('photos', []),
-        'reported_by': user.username or str(user.id),
-        'reported_by_id': str(user.id),
-        'status': 'pending', 'date': datetime.now().isoformat()
-    }
+        r = update.message.reply_to_message
+        if r.forward_from: sid, suname = str(r.forward_from.id), r.forward_from.username or f'id{sid}'
+        elif r.from_user and r.from_user.id != user.id: sid, suname = str(r.from_user.id), r.from_user.username or f'id{sid}'
+        reason = args_text
+    elif args:
+        for i, a in enumerate(args):
+            if a.startswith('@'): suname = a[1:]; reason = ' '.join(args[i+1:]) if i+1 < len(args) else ''; break
+        if not suname: reason = ' '.join(args)
+    if not suname and not sid: await update.message.reply_text("📝 /report @user причина + фото"); return
+    if update.message.photo:
+        ph = update.message.photo[-1]; f = await context.bot.get_file(ph.file_id)
+        fn = f"{EVIDENCE_DIR}/{user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_0.jpg"
+        await f.download_to_drive(fn); photos.append(fn)
+    rid = str(datetime.now().timestamp())
+    reports[rid] = {'rid': rid, 'suname': suname, 'sid': sid, 'reason': reason or 'Не указана', 'photos': photos, 'by': user.username or str(user.id), 'by_id': str(user.id), 'status': 'pending', 'date': datetime.now().isoformat()}
     save_json(REPORTS_FILE, reports)
-    del pending_reports[user.id]
-    await update.message.reply_text(f"✅ Отправлено!\n🆔 {report_id[:10]}\n⏳ Ожидайте.")
-    await send_report_to_admin(context, report_id)
+    await update.message.reply_text(f"✅ Отправлено!\n🆔 {rid[:10]}\n⏳ Ожидайте")
+    await send_report(context, rid)
 
-async def send_report_to_admin(context: ContextTypes.DEFAULT_TYPE, report_id: str, excluded: List[int] = None):
-    if report_id not in reports or report_id in report_assignments: return
-    report = reports[report_id]
-    if excluded is None: excluded = []
-    admin_id = get_random_admin(exclude=excluded)
-    if not admin_id: return
-    report_assignments[report_id] = {
-        'admin_id': admin_id, 'expires': datetime.now() + timedelta(minutes=5),
-        'excluded_admins': excluded + [admin_id]
-    }
-    keyboard = [[
-        InlineKeyboardButton("🚫 ЗАБАНИТЬ", callback_data=f"report_ban_{report_id}"),
-        InlineKeyboardButton("✅ ОТКЛОНИТЬ", callback_data=f"report_reject_{report_id}")
-    ]]
+async def scam_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await report_command(update, context)
+async def handle_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE): await report_command(update, context)
+async def handle_reason(update, context): pass
+async def done_command(update, context): pass
+
+async def send_report(context, rid: str, excluded: List[int] = None):
+    if rid not in reports or rid in report_assignments: return
+    r = reports[rid]
+    aid = get_random_admin(exclude=excluded or [])
+    if not aid: return
+    report_assignments[rid] = {'aid': aid, 'exp': datetime.now() + timedelta(minutes=5), 'excluded': (excluded or []) + [aid]}
+    kb = [[InlineKeyboardButton("🚫 БАН", callback_data=f"rb_{rid}"), InlineKeyboardButton("✅ ОТКЛОН", callback_data=f"rr_{rid}")]]
+    photos = r.get('photos', [])
     try:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=f"🚨 НОВАЯ ЖАЛОБА\n\n🆔 {report_id[:10]}\n👤 @{report['scammer_username']}\n📝 {report['reason']}\n👮 @{report['reported_by']}\n📸 {len(report.get('photos', []))} фото\n⏳ 5 минут!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        for photo_path in report.get('photos', []):
-            try:
-                with open(photo_path, 'rb') as f:
-                    await context.bot.send_photo(chat_id=admin_id, photo=f)
-            except: pass
-        asyncio.create_task(check_report_timeout(context, report_id, 300))
+        if photos:
+            with open(photos[0], 'rb') as pf: await context.bot.send_photo(aid, pf, caption=f"🚨 ЖАЛОБА\n🆔 {rid[:10]}\n👤 @{r['suname']}\n📝 {r['reason']}\n👮 @{r['by']}\n📸 {len(photos)} фото\n⏳ 5 мин!", reply_markup=InlineKeyboardMarkup(kb))
+            for pp in photos[1:]:
+                try:
+                    with open(pp, 'rb') as pf: await context.bot.send_photo(aid, pf)
+                except: pass
+        else:
+            await context.bot.send_message(aid, f"🚨 ЖАЛОБА\n🆔 {rid[:10]}\n👤 @{r['suname']}\n📝 {r['reason']}\n👮 @{r['by']}\n⏳ 5 мин!", reply_markup=InlineKeyboardMarkup(kb))
     except:
-        del report_assignments[report_id]
-        await send_report_to_admin(context, report_id, excluded + [admin_id])
-
-async def check_report_timeout(context, report_id: str, delay: int = 300):
-    await asyncio.sleep(delay)
-    if report_id not in reports or reports[report_id]['status'] != 'pending': return
-    assignment = report_assignments.get(report_id)
-    if not assignment: return
-    del report_assignments[report_id]
-    try: await context.bot.send_message(chat_id=assignment['admin_id'], text=f"⏰ Жалоба передана.")
-    except: pass
-    await send_report_to_admin(context, report_id, assignment['excluded_admins'])
+        del report_assignments[rid]
+        await send_report(context, rid, (excluded or []) + [aid])
 
 async def admin_report_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    admin = query.from_user
-    if not is_staff(admin.id): await query.answer("❌ Нет прав!", show_alert=True); return
-    
-    data = query.data
-    
-    if 'report_ban_' in data:
-        report_id = data.replace('report_ban_', '')
-        if report_id not in reports: await query.edit_message_text("❌ Не найдена."); return
-        
-        report = reports[report_id]
-        report['status'] = 'approved'
-        report['reviewed_by'] = str(admin.id)
+    q = update.callback_query; await q.answer()
+    if not is_staff(q.from_user.id): await q.answer("❌", show_alert=True); return
+    data = q.data
+    if data.startswith('rb_'):
+        rid = data[3:]
+        if rid not in reports: await q.edit_message_text("❌"); return
+        r = reports[rid]; r['status'] = 'approved'
         stats['reports_approved'] = stats.get('reports_approved', 0) + 1
         stats['scammers_banned'] = stats.get('scammers_banned', 0) + 1
         stats['reports_processed'] = stats.get('reports_processed', 0) + 1
-        
-        scammer_id_str = report.get('scammer_id', '')
-        scammer_username = report.get('scammer_username', '')
-        clean_username = scammer_username.replace('@', '').strip() if scammer_username else ""
-        
-        scammer_id = 0
-        if scammer_id_str and scammer_id_str.lstrip('-').isdigit():
-            try: scammer_id = int(scammer_id_str)
-            except: scammer_id = 0
-        
-        if (not scammer_id or scammer_id == 0) and clean_username:
-            if GROUP_ID:
-                try:
-                    member = await context.bot.get_chat_member(GROUP_ID, f'@{clean_username}')
-                    if member and member.user:
-                        scammer_id = member.user.id
-                        scammer_id_str = str(member.user.id)
+        clean = r['suname'].replace('@', '').strip()
+        uid = int(r['sid']) if r.get('sid', '').lstrip('-').isdigit() else 0
+        if not uid and clean:
+            try: uid = (await context.bot.get_chat_member(GROUP_ID, f'@{clean}')).user.id
+            except:
+                try: uid = (await context.bot.get_chat(f'@{clean}')).id
                 except: pass
-            if not scammer_id:
-                try:
-                    chat = await context.bot.get_chat(f'@{clean_username}')
-                    if chat and chat.id:
-                        scammer_id = chat.id
-                        scammer_id_str = str(chat.id)
-                except: pass
-        
-        banned = await ban_user_via_userbot(scammer_id, clean_username, GROUP_ID)
-        if not banned and scammer_id and GROUP_ID:
-            try: await context.bot.ban_chat_member(chat_id=GROUP_ID, user_id=scammer_id); banned = True
-            except: pass
-        
-        key = scammer_id_str if scammer_id_str else f"@{clean_username}"
-        if not key or key == '@': key = f"report_{report_id[:10]}"
-        
-        scammers[key] = {
-            'username': scammer_username, 'scammer_id': scammer_id_str,
-            'reason': report['reason'], 'banned_date': datetime.now().isoformat(),
-            'banned_successfully': banned, 'banned_by': admin.username or str(admin.id)
-        }
-        
+        banned = await ban_user(uid, clean, GROUP_ID)
+        scammers[str(uid) if uid else clean] = {'username': r['suname'], 'sid': str(uid), 'reason': r['reason'], 'banned': banned, 'date': datetime.now().isoformat()}
         save_json(SCAMMERS_FILE, scammers)
         save_json(REPORTS_FILE, reports)
         save_json(STATS_FILE, stats)
-        report_assignments.pop(report_id, None)
-        
-        status = f"✅ ЗАБАНЕН\n👤 @{scammer_username}" if banned else f"⚠️ В базе скамеров\n👤 @{scammer_username}"
-        await query.edit_message_text(f"🚫 {status}")
-        try:
-            await context.bot.send_message(
-                chat_id=int(report['reported_by_id']),
-                text=f"✅ Жалоба на @{scammer_username} одобрена! {'Забанен.' if banned else 'В базе скамеров.'}"
-            )
-        except: pass
-    
-    elif 'report_reject_' in data:
-        report_id = data.replace('report_reject_', '')
-        if report_id not in reports: await query.edit_message_text("❌ Не найдена."); return
-        report = reports[report_id]
-        report['status'] = 'rejected'
-        report['reviewed_by'] = str(admin.id)
+        report_assignments.pop(rid, None)
+        for pp in r.get('photos', []):
+            try: os.remove(pp)
+            except: pass
+        await q.edit_message_text(f"🚫 {'✅ ЗАБАНЕН' if banned else '⚠️ В базе'}\n👤 @{r['suname']}")
+    elif data.startswith('rr_'):
+        rid = data[3:]
+        if rid not in reports: await q.edit_message_text("❌"); return
+        r = reports[rid]; r['status'] = 'rejected'
         stats['reports_rejected'] = stats.get('reports_rejected', 0) + 1
         stats['reports_processed'] = stats.get('reports_processed', 0) + 1
         save_json(REPORTS_FILE, reports)
         save_json(STATS_FILE, stats)
-        report_assignments.pop(report_id, None)
-        await query.edit_message_text("✅ ОТКЛОНЕНО")
-        try: await context.bot.send_message(chat_id=int(report['reported_by_id']), text=f"❌ Жалоба отклонена.")
-        except: pass
+        report_assignments.pop(rid, None)
+        for pp in r.get('photos', []):
+            try: os.remove(pp)
+            except: pass
+        await q.edit_message_text("✅ ОТКЛОНЕНО")
 
 # ============ ПРОСМОТР ЗАЯВОК ============
 async def reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_staff(update.effective_user.id): await update.message.reply_text("❌ Нет прав!"); return
-    if update.message.chat.type != 'private': await update.message.reply_text("⚠️ Только в ЛС!"); return
+    if not is_staff(update.effective_user.id): await update.message.reply_text("❌"); return
     pending = {k: v for k, v in reports.items() if v['status'] == 'pending'}
-    if not pending: await update.message.reply_text("✅ Нет активных заявок!"); return
-    sorted_reports = sorted(pending.items(), key=lambda x: x[1]['date'], reverse=True)[:5]
-    for report_id, report in sorted_reports:
-        text = f"🚨 ЗАЯВКА {report_id[:10]}\n\n👤 @{report['scammer_username']}\n📝 {report['reason']}\n👮 @{report['reported_by']}\n📸 {len(report.get('photos', []))} фото"
-        keyboard = [[
-            InlineKeyboardButton("🚫 ЗАБАНИТЬ", callback_data=f"report_ban_{report_id}"),
-            InlineKeyboardButton("✅ ОТКЛОНИТЬ", callback_data=f"report_reject_{report_id}")
-        ]]
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        for photo_path in report.get('photos', []):
+    if not pending: await update.message.reply_text("✅ Нет заявок"); return
+    for rid, r in sorted(pending.items(), key=lambda x: x[1]['date'], reverse=True)[:5]:
+        kb = [[InlineKeyboardButton("🚫 БАН", callback_data=f"rb_{rid}"), InlineKeyboardButton("✅ ОТКЛОН", callback_data=f"rr_{rid}")]]
+        await update.message.reply_text(f"🚨 {rid[:10]}\n👤 @{r['suname']}\n📝 {r['reason']}\n👮 @{r['by']}", reply_markup=InlineKeyboardMarkup(kb))
+        for pp in r.get('photos', []):
             try:
-                with open(photo_path, 'rb') as f:
-                    await context.bot.send_photo(chat_id=update.message.chat_id, photo=f)
+                with open(pp, 'rb') as pf: await context.bot.send_photo(update.message.chat_id, pf)
             except: pass
 
-# ============ ГРУППОВЫЕ ОБРАБОТЧИКИ ============
+# ============ ГРУППА ============
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user: return
-    user = update.message.from_user
-    
-    if SUBSCRIPTION_CHECK_ENABLED and not await check_subscription(user.id, context):
-        await handle_unsubscribed_user(update, context, user.id)
-        return
-    
-    if str(user.id) in scammers:
-        try:
-            await update.message.delete()
-            await context.bot.ban_chat_member(chat_id=update.message.chat_id, user_id=user.id)
+    u = update.message.from_user
+    if SUBSCRIPTION_CHECK_ENABLED and not await check_subscription(u.id, context): await handle_unsubscribed_user(update, context, u.id); return
+    if str(u.id) in scammers:
+        try: await update.message.delete(); await context.bot.ban_chat_member(update.message.chat_id, u.id)
         except: pass
 
-async def delete_join_left_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_join_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
-    is_join = update.message.new_chat_members is not None
-    is_left = update.message.left_chat_member is not None
-    if is_join or is_left:
-        try:
-            await update.message.delete()
-            stats['join_messages_deleted'] = stats.get('join_messages_deleted', 0) + 1
-            save_json(STATS_FILE, stats)
+    if update.message.new_chat_members or update.message.left_chat_member:
+        try: await update.message.delete(); stats['join_messages_deleted'] = stats.get('join_messages_deleted', 0) + 1; save_json(STATS_FILE, stats)
         except: pass
-        if is_join:
-            for member in update.message.new_chat_members:
-                if str(member.id) in scammers:
-                    try: await context.bot.ban_chat_member(chat_id=update.message.chat_id, user_id=member.id)
-                    except: pass
 
-# ============ КОМАНДЫ ============
+# ============ ПАГИНАЦИЯ СКАМЕРОВ ============
+SCAMMERS_PER_PAGE = 10
+
 async def scammer_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    page = 1
+    if context.args and context.args[0].isdigit(): page = int(context.args[0])
+    items = list(scammers.items())
+    total_pages = max(1, (len(items) + SCAMMERS_PER_PAGE - 1) // SCAMMERS_PER_PAGE)
+    if page < 1: page = 1
+    if page > total_pages: page = total_pages
+    start = (page - 1) * SCAMMERS_PER_PAGE
+    end = start + SCAMMERS_PER_PAGE
+    page_items = items[start:end]
     if not scammers: await update.message.reply_text("✅ Пусто!"); return
-    text = f"🚫 Скамеры ({len(scammers)}):\n\n"
-    for uid, data in list(scammers.items())[:20]:
-        text += f"• {uid}" + (f" @{data['username']}" if data.get('username') else "") + "\n"
-    await update.message.reply_text(text[:4000])
+    text = f"🚫 *Скамеры* (стр. {page}/{total_pages}, всего {len(scammers)}):\n\n"
+    for uid, data in page_items:
+        text += f"• `{uid}`"
+        if data.get('username'): text += f" @{data['username']}"
+        if data.get('reason'): text += f" — {data['reason'][:40]}"
+        text += "\n"
+    buttons = []
+    row = []
+    if page > 1: row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"sc_page_{page-1}"))
+    if page < total_pages: row.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"sc_page_{page+1}"))
+    if row: buttons.append(row)
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+    await update.message.reply_text(text[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
+async def scammer_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data
+    if data.startswith('sc_page_'):
+        page = int(data.replace('sc_page_', ''))
+        items = list(scammers.items())
+        total_pages = max(1, (len(items) + SCAMMERS_PER_PAGE - 1) // SCAMMERS_PER_PAGE)
+        if page < 1: page = 1
+        if page > total_pages: page = total_pages
+        start = (page - 1) * SCAMMERS_PER_PAGE
+        end = start + SCAMMERS_PER_PAGE
+        page_items = items[start:end]
+        text = f"🚫 *Скамеры* (стр. {page}/{total_pages}, всего {len(scammers)}):\n\n"
+        for uid, data in page_items:
+            text += f"• `{uid}`"
+            if data.get('username'): text += f" @{data['username']}"
+            if data.get('reason'): text += f" — {data['reason'][:40]}"
+            text += "\n"
+        buttons = []
+        row = []
+        if page > 1: row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"sc_page_{page-1}"))
+        if page < total_pages: row.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"sc_page_{page+1}"))
+        if row: buttons.append(row)
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        try: await q.edit_message_text(text[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        except: await q.edit_message_text(text[:4000], reply_markup=reply_markup)
+
+# ============ HELP ============
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if is_owner(u.id):
+        text = "🤖 ILLUMI BOT — Владелец\n\n/report @user — жалоба\n/deal @user цена — сделка\n/scammer_list — скамеры\n/reports — заявки\n/stats — статистика\n/deals — сделки\n/close_deal [id] — закрыть\n/help — помощь"
+    elif is_admin(u.id):
+        text = "🤖 ILLUMI BOT — Гарант\n\n/report @user — жалоба\n/deal @user цена — сделка\n/scammer_list — скамеры\n/reports — заявки\n/deals — сделки\n/close_deal [id] — закрыть\n/help — помощь"
+    else:
+        text = "🤖 ILLUMI BOT\n\n/report @user — жалоба\n/deal @user цена — сделка\n/scammer_list — скамеры\n/help — помощь"
+    
+    buttons = [["/help"]]
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "/help": await help_cmd(update, context)
+
+# ============ ДРУГИЕ КОМАНДЫ ============
 async def deals_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_staff(update.effective_user.id): await update.message.reply_text("❌ Нет прав!"); return
-    if update.message.chat.type != 'private': await update.message.reply_text("⚠️ Только в ЛС!"); return
+    if not is_staff(update.effective_user.id): return
+    if update.message.chat.type != 'private': return
     active = {k: v for k, v in deals.items() if v['status'] == 'active'}
-    if not active: await update.message.reply_text("✅ Нет активных сделок!"); return
-    text = f"🔒 Сделки ({len(active)}):\n\n"
-    for did, deal in list(active.items())[:10]:
-        text += f"🆔 {did[:10]} | #{deal.get('deal_number', '?')}\n💰 {deal['price']}\n👤 @{deal['creator_username']} ↔ @{deal['partner_username']}\n👮 {'✅' if deal.get('admin_accepted') else '⏳'}\n\n"
-    await update.message.reply_text(text[:4000])
+    if not active: await update.message.reply_text("✅ Нет сделок"); return
+    t = f"🔒 Сделки ({len(active)}):\n\n"
+    for did, d in list(active.items())[:10]: t += f"🆔 {did[:10]} | #{d.get('dn','?')}\n💰 {d['price']}\n👤 @{d['cname']} ↔ @{d['partner']}\n👮 {'✅' if d.get('accepted') else '⏳'}\n\n"
+    await update.message.reply_text(t[:4000])
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_staff(update.effective_user.id): await update.message.reply_text("❌ Нет прав!"); return
-    if update.message.chat.type != 'private': await update.message.reply_text("⚠️ Только в ЛС!"); return
-    await update.message.reply_text(
-        f"📊 Статистика\n\n"
-        f"🗑 Сообщений: {stats.get('messages_deleted', 0)}\n"
-        f"🚪 Входов/выходов: {stats.get('join_messages_deleted', 0)}\n"
-        f"⚠️ Предупреждений: {stats.get('subscription_warnings', 0)}\n"
-        f"🔇 Замучено: {stats.get('users_muted', 0)}\n"
-        f"🚫 Скамеров: {len(scammers)}\n"
-        f"📋 Жалоб: {stats.get('reports_processed', 0)}\n"
-        f"🔒 Сделок: {stats.get('deals_created', 0)}"
-    )
+    if not is_owner(update.effective_user.id): return
+    if update.message.chat.type != 'private': return
+    await update.message.reply_text(f"📊 Статистика\n\n🗑 Удалено: {stats.get('messages_deleted', 0)}\n🚪 Входы/выходы: {stats.get('join_messages_deleted', 0)}\n⚠️ Предупреждения: {stats.get('subscription_warnings', 0)}\n🔇 Муты: {stats.get('users_muted', 0)}\n🚫 Скамеры: {len(scammers)}\n📋 Жалобы: {stats.get('reports_processed', 0)}\n🔒 Сделок создано: {stats.get('deals_created', 0)}\n📊 ВСЕГО:\n✅ Успешных: {permanent_stats.get('total_deals_completed', 0)}\n❌ Отмененных: {permanent_stats.get('total_deals_cancelled', 0)}")
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_type = update.message.chat.type
-    if chat_type == 'private':
-        if is_staff(user.id):
-            role = "👑 Владелец" if is_owner(user.id) else "👮 Гарант/Админ"
-            await update.message.reply_text(
-                f"🤖 ILLUMI DEAL BOT\n\n{role}\n\n"
-                f"📝 /scam @user — жалоба\n🔒 /deal @user цена — сделка\n"
-                f"🚫 /scammer_list — скамеры\n📋 /reports — заявки\n"
-                f"📊 /stats — статистика\n📋 /deals — сделки\n"
-                f"/close_deal [id] — закрыть"
-            )
-        else:
-            await update.message.reply_text(
-                f"🤖 ILLUMI DEAL BOT\n\n"
-                f"📝 /scam @user — жалоба\n🔒 /deal @user цена — сделка\n"
-                f"🚫 /scammer_list — скамеры"
-            )
-    else:
-        await update.message.reply_text(
-            f"🤖 ILLUMI DEAL BOT\n\n"
-            f"🔒 /deal @user цена (в ЛС)\n📝 /scam @user (в ЛС)\n"
-            f"🚫 /scammer_list — скамеры"
-        )
+    u = update.effective_user
+    if is_owner(u.id): await update.message.reply_text("🤖 ILLUMI BOT — Владелец\n\n/deal | /report | /scammer_list | /reports | /stats | /deals | /close_deal | /help")
+    elif is_admin(u.id): await update.message.reply_text("🤖 ILLUMI BOT — Гарант\n\n/deal | /report | /scammer_list | /reports | /deals | /close_deal | /help")
+    else: await update.message.reply_text("🤖 ILLUMI BOT\n\n/deal | /report | /scammer_list | /help")
 
-# ============ ЗАПУСК ============
-# ============ ЗАПУСК ============
+async def set_bot_commands(app):
+    commands = [BotCommand("deal", "создать сделку"), BotCommand("report", "пожаловаться на скамера"), BotCommand("scammer_list", "список скамеров"), BotCommand("help", "помощь")]
+    await app.bot.set_my_commands(commands)
+
 # ============ ЗАПУСК ============
 def main():
     global app_job_queue, bot_instance
+    if not BOT_TOKEN: print("❌ BOT_TOKEN!"); return
     
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN не указан!")
-        return
-    
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(60)
-        .pool_timeout(60)
-        .build()
-    )
-    
+    application = Application.builder().token(BOT_TOKEN).read_timeout(60).write_timeout(60).connect_timeout(60).pool_timeout(60).build()
     app_job_queue = application.job_queue
     
     application.add_handler(CommandHandler('deal', deal_command))
     application.add_handler(CommandHandler('ready', ready_command))
-    application.add_handler(CallbackQueryHandler(admin_deal_response, pattern='^admin_'))
+    application.add_handler(CallbackQueryHandler(admin_deal_response, pattern='^ad'))
     application.add_handler(CommandHandler('close_deal', close_deal_cmd))
+    application.add_handler(CommandHandler('report', report_command))
     application.add_handler(CommandHandler('scam', scam_command))
     application.add_handler(CommandHandler('done', done_command))
     application.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_evidence))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_reason))
-    application.add_handler(CallbackQueryHandler(admin_report_response, pattern='^report_'))
+    application.add_handler(CallbackQueryHandler(admin_report_response, pattern='^r'))
+    application.add_handler(CallbackQueryHandler(scammer_pagination, pattern='^sc_page_'))
     application.add_handler(CommandHandler('reports', reports_cmd))
     application.add_handler(CommandHandler('deals', deals_list_cmd))
     application.add_handler(CommandHandler('stats', stats_cmd))
     application.add_handler(CommandHandler('scammer_list', scammer_list_cmd))
+    application.add_handler(CommandHandler('help', help_cmd))
     application.add_handler(MessageHandler(~filters.COMMAND & filters.ChatType.GROUPS, message_handler))
-    application.add_handler(MessageHandler(filters.StatusUpdate.ALL, delete_join_left_messages))
+    application.add_handler(MessageHandler(filters.StatusUpdate.ALL, delete_join_left))
     application.add_handler(ChatMemberHandler(admin_status_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CommandHandler('start', start_cmd))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, button_handler))
     
     async def post_init(app):
         global bot_instance
         bot_instance = app.bot
-        
         await resolve_usernames(app.bot)
         await load_garants_from_group(app.bot)
+        await set_bot_commands(app)
         
         async def keep_alive(ctx):
-            logger.debug("💓 Keep-alive")
+            try: await ctx.bot.get_me()
+            except: pass
+        
+        async def cleanup_job(ctx): cleanup_all()
         
         if app.job_queue:
-            app.job_queue.run_repeating(keep_alive, interval=300)
+            app.job_queue.run_repeating(keep_alive, interval=30, first=5)
+            app.job_queue.run_repeating(cleanup_job, interval=259200, first=60)
         
-        print(f"""
-╔══════════════════════════════════════╗
-║   🤖 ILLUMI DEAL BOT v8.0         ║
-║   👑 {resolved_owner_id or 'не указан'}                       ║
-║   👮 .env: {len(resolved_admin_ids)}  🏷 Гарантов: {len(group_garant_ids)}      ║
-║   🔇 Мут после {WARNING_LIMIT} предупреждений         ║
-║   💓 Keep-alive: 5 мин            ║
-╚══════════════════════════════════════╝
-        """)
+        print(f"🤖 ILLUMI BOT v13 | 👑 {resolved_owner_id} | 👮 {len(resolved_admin_ids)} | 🏷 {len(group_garant_ids)}")
     
     application.post_init = post_init
     
-    print("🤖 Запуск бота...")
-    
     if WEBHOOK_URL:
-        print(f"🔗 Webhook: {WEBHOOK_URL}")
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=WEBHOOK_PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            drop_pending_updates=True
-        )
+        application.run_webhook(listen="0.0.0.0", port=WEBHOOK_PORT, url_path=BOT_TOKEN, webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}", drop_pending_updates=True)
     else:
-        print("🔄 Polling...")
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-        
 if __name__ == '__main__':
     main()
